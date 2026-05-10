@@ -1,0 +1,99 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>  
+#include <WiFi.h>
+#include <esp_now.h>
+
+TFT_eSPI tft = TFT_eSPI(); //
+
+// Motor Pins
+#define AIN1 1 
+#define AIN2 2 
+#define PWMA 3 
+#define PWMB 12 
+#define STBY 16 
+#define BIN1 10 
+#define BIN2 11 
+
+typedef struct struct_message {
+    char command[10];
+} struct_message;
+
+struct_message incomingData;
+bool newCommand = false;
+
+// Callback when data is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *data, int len) {
+    memcpy(&incomingData, data, sizeof(incomingData));
+    newCommand = true;
+}
+
+void moveForward() { //
+  digitalWrite(AIN1, HIGH); //
+  digitalWrite(AIN2, LOW); //
+  digitalWrite(BIN1, HIGH); //
+  digitalWrite(BIN2, LOW); //
+  analogWrite(PWMA, 255); //
+  analogWrite(PWMB, 240); //
+}
+
+void moveBackward() { //
+  digitalWrite(AIN1, LOW); //
+  digitalWrite(AIN2, HIGH); //
+  digitalWrite(BIN1, LOW); //
+  digitalWrite(BIN2, HIGH); //
+  analogWrite(PWMA, 255); //
+  analogWrite(PWMB, 230); //
+}
+
+void stopMotor() { //
+  digitalWrite(AIN1, LOW); //
+  digitalWrite(AIN2, LOW); //
+  digitalWrite(BIN1, LOW); //
+  digitalWrite(BIN2, LOW); //
+  digitalWrite(PWMA, LOW); //
+  digitalWrite(PWMB, LOW); //
+}
+
+void setup() {
+  Serial.begin(115200); //
+  
+  tft.init(); //
+  tft.fillScreen(TFT_BLACK); //
+  
+  pinMode(AIN1, OUTPUT); //
+  pinMode(AIN2, OUTPUT); //
+  pinMode(BIN1, OUTPUT); //
+  pinMode(BIN2, OUTPUT); //
+  pinMode(PWMA, OUTPUT); //
+  pinMode(PWMB, OUTPUT); //
+  pinMode(STBY, OUTPUT); //
+  digitalWrite(STBY, HIGH); //
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("Slave MAC Address: ");
+  Serial.println(WiFi.macAddress()); // Use this for the Master code!
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+}
+
+void loop() {
+  if (newCommand) {
+    newCommand = false;
+    if (strcmp(incomingData.command, "up") == 0) {
+      tft.setCursor(10, 10); tft.print("Moving UP  ");
+      moveForward(); //
+      delay(2000); // Adjust lift duration as needed
+      stopMotor(); //
+    } 
+    else if (strcmp(incomingData.command, "down") == 0) {
+      tft.setCursor(10, 10); tft.print("Moving DOWN");
+      moveBackward(); //
+      delay(2000); // Adjust lift duration as needed
+      stopMotor(); //
+    }
+  }
+}

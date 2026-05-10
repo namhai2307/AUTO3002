@@ -1,0 +1,580 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_now.h>
+#include <esp_task_wdt.h>
+
+// ── ESP-NOW Configuration ─────────────────────────────────────
+// REPLACE WITH YOUR SLAVE'S MAC ADDRESS
+
+// Slave 1 - the lift
+uint8_t liftAddress[] = {0xE4, 0xB0, 0x63, 0x8A, 0x21, 0x70}; //E4:B0:63:8A:21:70
+
+// Slave 2 - the robot arm
+uint8_t armAddress[] = {0x64, 0xE8, 0x33, 0x4D, 0x3D, 0x2C}; //64:E8:33:4D:3D:2C
+// Broadcast used for arm commands so delivery works regardless of exact MAC
+uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+typedef struct struct_message { 
+    char command[10]; 
+} struct_message;
+
+struct_message liftData;
+esp_now_peer_info_t peerInfo;
+
+// ── ESP-NOW receive callback ─────────────────────────────────
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
+#else
+void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len)
+#endif
+{
+  // receive callback kept for future use
+  (void)data; (void)len;
+}
+
+// ── WiFi Access Point ────────────────────────────────────────
+const char* AP_SSID = "ChassisControl";
+const char* AP_PASS = "12345678";
+
+WebServer server(80);
+
+// ── Pending command ───
+enum CmdType { CMD_NONE, CMD_FWD, CMD_BWD, CMD_STRAFE_L, CMD_STRAFE_R, CMD_TURN_L, CMD_TURN_R, CMD_SEQUENCE }; //
+CmdType pendingCmd  = CMD_NONE;
+long    pendingTicks = 0; 
+int     pendingSpeed = 50;
+volatile bool emergencyStop = false;
+volatile bool skipLimitSw   = false;
+volatile bool sequenceRunning = false;
+
+// ── HTML control panel ───────────────────────────────────────
+static const char INDEX_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chassis Control</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#1a1a2e;color:#eee;font-family:Arial,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:24px}
+  h1{font-size:1.4rem;letter-spacing:2px;color:#e94560}
+  .ticks-row{display:flex;align-items:center;gap:10px}
+  .ticks-row label{font-size:.9rem;color:#aaa}
+  input[type=number]{background:#16213e;border:1px solid #e94560;color:#eee;padding:8px 12px;border-radius:8px;width:110px;font-size:1rem;text-align:center}
+  .dpad{display:grid;grid-template-columns:64px 64px 64px;grid-template-rows:64px 64px 64px;gap:6px}
+  .btn{background:#16213e;border:2px solid #e94560;border-radius:10px;color:#eee;font-size:1.4rem;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+  .btn:active,.btn.active{background:#e94560}
+  .btn.center{background:#0f3460;border-color:#0f3460;cursor:default}
+  .status{font-size:.8rem;color:#888;min-height:1.2em}
+  .seq-btns{display:flex;gap:12px;margin-top:4px;flex-wrap:wrap;justify-content:center}
+  .btn-start{background:#27ae60;border:2px solid #2ecc71;border-radius:10px;color:#fff;font-size:1rem;padding:12px 28px;cursor:pointer;font-weight:bold}
+  .btn-stop{background:#c0392b;border:2px solid #e74c3c;border-radius:10px;color:#fff;font-size:1rem;padding:12px 28px;cursor:pointer;font-weight:bold}
+  .btn-lift{background:#6a1b9a;border:2px solid #9c27b0;border-radius:10px;color:#fff;font-size:1rem;padding:12px 28px;cursor:pointer;font-weight:bold}
+  .btn-arm{background:#1a5276;border:2px solid #2e86c1;border-radius:10px;color:#fff;font-size:1rem;padding:12px 28px;cursor:pointer;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>CHASSIS CONTROL</h1>
+<div class="ticks-row">
+  <label>Ticks:</label>
+  <input type="number" id="ticks" value="1500" min="1">
+</div>
+<div class="ticks-row">
+  <label>Speed %:</label>
+  <input type="number" id="speed" value="50" min="1" max="100">
+</div>
+<div class="dpad">
+  <button class="btn" id="btnTL" onclick="send('turn_l')">&#8634;</button>
+  <button class="btn" id="btnFwd" onclick="send('fwd')">&#9650;</button>
+  <button class="btn" id="btnTR" onclick="send('turn_r')">&#8635;</button>
+  <button class="btn" id="btnL" onclick="send('strafe_l')">&#9668;</button>
+  <div class="btn center"></div>
+  <button class="btn" id="btnR" onclick="send('strafe_r')">&#9658;</button>
+  <div class="btn center"></div>
+  <button class="btn" id="btnBwd" onclick="send('bwd')">&#9660;</button>
+  <div class="btn center"></div>
+</div>
+<div class="seq-btns">
+  <button class="btn-lift" onclick="lift('up')">LIFT UP</button>
+  <button class="btn-lift" onclick="lift('down')">LIFT DOWN</button>
+</div>
+<div class="seq-btns">
+  <button class="btn-arm" onclick="armGroup()">&#129470; ARM NEXT GROUP</button>
+</div>
+<div class="seq-btns">
+  <button class="btn-start" onclick="startSeq()">&#9654; START</button>
+  <button class="btn-stop"  onclick="stopSeq()">&#9632; STOP</button>
+</div>
+<p class="status" id="status">Ready</p>
+<script>
+async function send(dir){
+  const t=document.getElementById('ticks').value||1500;
+  const s=document.getElementById('speed').value||50;
+  try{
+    const r=await fetch('/move?dir='+dir+'&ticks='+t+'&speed='+s);
+    const txt=await r.text();
+    document.getElementById('status').textContent=txt;
+  }catch(e){document.getElementById('status').textContent='Error: '+e;}
+}
+async function lift(dir){
+  document.getElementById('status').textContent='Sending Lift ' + dir.toUpperCase();
+  try{
+    const r=await fetch('/lift?dir='+dir);
+    const txt=await r.text();
+    document.getElementById('status').textContent='Lift: '+txt;
+  }catch(e){document.getElementById('status').textContent='Error: '+e;}
+}
+async function startSeq(){
+  try{
+    const r=await fetch('/start');
+    const txt=await r.text();
+    document.getElementById('status').textContent=txt;
+  }catch(e){document.getElementById('status').textContent='Error: '+e;}
+}
+async function stopSeq(){
+  document.getElementById('status').textContent='EMERGENCY STOP';
+  try{await fetch('/stop');}catch(e){}
+}
+async function armGroup(){
+  document.getElementById('status').textContent='Sending ARM next group...';
+  try{
+    const r=await fetch('/arm');
+    const txt=await r.text();
+    document.getElementById('status').textContent='Arm: '+txt;
+  }catch(e){document.getElementById('status').textContent='Error: '+e;}
+}
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ── Pin definitions ──────────────────────────────────────────
+#define Enc_1_A     14
+#define Enc_1_B     13
+#define Motor1_Dir1 19
+#define Motor1_Dir2 12
+#define Motor1_PWM  21
+
+#define Enc_2_A     4
+#define Enc_2_B     15
+#define Motor2_Dir1 16
+#define Motor2_Dir2 2
+#define Motor2_PWM  0
+
+#define Enc_3_A     23
+#define Enc_3_B     22
+#define Motor3_Dir1 5
+#define Motor3_Dir2 17
+#define Motor3_PWM  18
+
+#define Enc_4_A     32
+#define Enc_4_B     33
+#define Motor4_Dir1 27
+#define Motor4_Dir2 26
+#define Motor4_PWM  25
+
+
+#define PWM_FREQ           20000  
+#define PWM_RESOLUTION     8      
+#define PWM_CH1            0
+#define PWM_CH2            1
+#define PWM_CH3            2
+#define PWM_CH4            3
+#define MOTOR_MIN_DUTY     60     
+#define SOFT_LAUNCH_STEPS  10     
+#define SOFT_LAUNCH_MS     20     
+#define STRAFE_DRIFT_COMP  10 
+#define FWD_DRIFT_COMP     12     // boost right-side motors (CH3, CH4); swap sides if drift is opposite
+
+// ── Encoder tick counters ────────────────────────────────────
+volatile long ticks1 = 0, ticks2 = 0, ticks3 = 0, ticks4 = 0;
+
+void IRAM_ATTR readEncoder1() { ticks1 += (digitalRead(Enc_1_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder2() { ticks2 += (digitalRead(Enc_2_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder3() { ticks3 += (digitalRead(Enc_3_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder4() { ticks4 += (digitalRead(Enc_4_B) > 0) ? 1 : -1; } //
+
+void resetTicks() {
+  noInterrupts();
+  ticks1 = ticks2 = ticks3 = ticks4 = 0;
+  interrupts();
+}
+
+// ── Low-level direction helpers ──────────────────────────────
+static void motor1SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor1_Dir1, HIGH); digitalWrite(Motor1_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, HIGH); }
+  else              { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, LOW); }
+}
+static void motor2SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor2_Dir1, HIGH); digitalWrite(Motor2_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, HIGH); }
+  else              { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, LOW); }
+}
+static void motor3SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor3_Dir1, HIGH); digitalWrite(Motor3_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, HIGH); }
+  else              { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, LOW); }
+}
+static void motor4SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor4_Dir1, HIGH); digitalWrite(Motor4_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, HIGH); }
+  else              { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, LOW); }
+}
+
+static void setAllPWM(uint8_t duty) {
+  ledcWrite(PWM_CH1, duty); ledcWrite(PWM_CH2, duty);
+  ledcWrite(PWM_CH3, duty); ledcWrite(PWM_CH4, duty);
+}
+
+void stopAll() {
+  setAllPWM(0);
+  motor1SetDir(0); motor2SetDir(0); motor3SetDir(0); motor4SetDir(0);
+}
+
+static bool softLaunchAllCheck(long target, uint8_t maxDuty) {
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    server.handleClient();
+    if (emergencyStop) return true;
+    esp_task_wdt_reset();
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((maxDuty - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    setAllPWM(duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts();
+    bool allDone = abs(ticks1) >= target || abs(ticks2) >= target || abs(ticks3) >= target || abs(ticks4) >= target;
+    interrupts();
+    if (allDone) return true;
+  }
+  return false;
+}
+
+// ── Combined movement ────────────────────────────────────────
+void moveForward(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(1); motor2SetDir(1); motor3SetDir(-1); motor4SetDir(-1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  // Right-side motors (CH3, CH4) get a small boost to compensate for drift
+  // Left-side is motor 1 and 2
+  ledcWrite(PWM_CH1, duty);
+  ledcWrite(PWM_CH2, duty);
+  ledcWrite(PWM_CH3, (uint8_t)min(255, (int)duty + FWD_DRIFT_COMP));
+  ledcWrite(PWM_CH4, (uint8_t)min(255, (int)duty + FWD_DRIFT_COMP));
+  while (true) {
+    server.handleClient();
+    if (emergencyStop) { stopAll(); return; }
+    esp_task_wdt_reset();
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (c1 >= ticks && c2 >= ticks && c3 >= ticks && c4 >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+void moveBackward(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1); motor3SetDir(1); motor4SetDir(1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  // Right-side motors (CH2, CH4) get a small boost to compensate for drift
+  ledcWrite(PWM_CH1, duty);
+  ledcWrite(PWM_CH2, duty);
+  ledcWrite(PWM_CH3, (uint8_t)min(255, (int)duty + FWD_DRIFT_COMP));
+  ledcWrite(PWM_CH4, (uint8_t)min(255, (int)duty + FWD_DRIFT_COMP));
+  while (true) {
+    server.handleClient();
+    if (emergencyStop) { stopAll(); return; }
+    esp_task_wdt_reset();
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (c1 >= ticks && c2 >= ticks && c3 >= ticks && c4 >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+void Go_Side_Way(long ticks, int speed) {
+  if (ticks == 0) return;
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  int d = (ticks > 0) ? 1 : -1;
+  motor1SetDir(-d); motor2SetDir(d); motor3SetDir(d); motor4SetDir(-d);
+  long target = abs(ticks);
+  if (softLaunchAllCheck(target, duty)) { stopAll(); return; }
+  while (true) {
+    server.handleClient();
+    if (emergencyStop) { stopAll(); return; }
+    esp_task_wdt_reset();
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (c1 >= target && c2 >= target && c3 >= target && c4 >= target) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+void turnLeft(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(1); motor2SetDir(1); motor3SetDir(1); motor4SetDir(1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  while (true) {
+    server.handleClient();
+    if (emergencyStop) { stopAll(); return; }
+    esp_task_wdt_reset();
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (c1 >= ticks && c2 >= ticks && c3 >= ticks && c4 >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+void turnRight(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1); motor3SetDir(-1); motor4SetDir(-1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  while (true) {
+    server.handleClient();
+    if (emergencyStop) { stopAll(); return; }
+    esp_task_wdt_reset();
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (c1 >= ticks && c2 >= ticks && c3 >= ticks && c4 >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+// ── Web route handlers ───────────────────────────────────────
+void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
+
+void handleMove() {
+  String dir = server.arg("dir");
+  pendingTicks = server.arg("ticks").toInt();
+  pendingSpeed = server.arg("speed").toInt();
+  if (dir == "fwd") pendingCmd = CMD_FWD;
+  else if (dir == "bwd") pendingCmd = CMD_BWD;
+  else if (dir == "strafe_l") pendingCmd = CMD_STRAFE_L;
+  else if (dir == "strafe_r") pendingCmd = CMD_STRAFE_R;
+  else if (dir == "turn_l") pendingCmd = CMD_TURN_L;
+  else if (dir == "turn_r") pendingCmd = CMD_TURN_R;
+  emergencyStop = false;
+  server.send(200, "text/plain", "OK");
+}
+
+static void sendLiftCommand(const char* cmd) {
+  strcpy(liftData.command, cmd);
+  esp_now_send(liftAddress, (uint8_t *) &liftData, sizeof(liftData));
+}
+
+static esp_err_t sendArmCommand(const char* cmd) {
+  struct_message msg;
+  memset(&msg, 0, sizeof(msg));
+  strcpy(msg.command, cmd);
+  esp_err_t result = esp_now_send(ESPNOW_BROADCAST, (uint8_t*)&msg, sizeof(msg));
+  Serial.print("sendArmCommand(");
+  Serial.print(cmd);
+  Serial.print(") -> ");
+  Serial.println(result == ESP_OK ? "OK" : "FAILED");
+  return result;
+}
+
+void handleLift() {
+  String dir = server.arg("dir");
+  sendLiftCommand(dir == "up" ? "up" : dir == "down" ? "down" : "stop");
+  server.send(200, "text/plain", "Sent");
+}
+
+void handleArm() {
+  esp_err_t result = sendArmCommand("next");
+  server.send(200, "text/plain", result == ESP_OK ? "Sent OK" : "Send FAILED");
+}
+
+void handleStart() {
+  if (sequenceRunning) { server.send(200, "text/plain", "Already running"); return; }
+  emergencyStop = false; pendingCmd = CMD_SEQUENCE; server.send(200, "text/plain", "Sequence Start");
+}
+void handleStop() { emergencyStop = true; sequenceRunning = false; stopAll(); pendingCmd = CMD_NONE; sendLiftCommand("stop"); sendArmCommand("stop"); server.send(200, "text/plain", "Stopped"); }
+
+// Wait for the given number of seconds.
+// Change ARM_WAIT_SEC in runSequence() to adjust the arm wait duration.
+static void wait(int seconds) {
+  unsigned long start = millis();
+  unsigned long duration = (unsigned long)seconds * 1000UL;
+  while (millis() - start < duration) {
+    server.handleClient();
+    if (emergencyStop) return;
+    esp_task_wdt_reset();  // prevent watchdog reset during long waits
+    delay(10);
+  }
+}
+
+// Send a lift command and hold it for the given duration, then stop the lift
+static void liftFor(const char* dir, int seconds) {
+  sendLiftCommand(dir);
+  unsigned long start = millis();
+  unsigned long duration = (unsigned long)seconds * 1000UL;
+  while (millis() - start < duration) {
+    server.handleClient();
+    if (emergencyStop) { sendLiftCommand("stop"); return; }
+    esp_task_wdt_reset();
+    delay(10);
+  }
+  sendLiftCommand("stop");
+}
+
+void runSequence() {
+  sequenceRunning = true;
+  emergencyStop = false;
+  Serial.println("[SEQ] Start");
+
+  // ── Phase 0: pick up the rock
+  // Change this value to adjust how long to wait for the arm to finish
+  const int ARM_WAIT_SEC = 14;
+  Serial.println("[SEQ] Sending arm command...");
+  sendArmCommand("next");
+  Serial.printf("[SEQ] Waiting %ds for arm to finish...\n", ARM_WAIT_SEC);
+  wait(ARM_WAIT_SEC); if (emergencyStop) { Serial.println("[SEQ] emergencyStop during arm wait"); sequenceRunning = false; return; }
+  Serial.println("[SEQ] Arm wait done, entering Phase 1");
+
+  // ── Phase 1 ────────────────────────────────────────
+  Serial.println("[SEQ] moveForward");
+  moveForward(3000, 60);
+  if (emergencyStop) { Serial.println("[SEQ] emergencyStop after moveForward"); return; }
+  wait(1); if (emergencyStop) return;
+
+  Serial.println("[SEQ] liftFor up");
+  liftFor("up", 25);
+  if (emergencyStop) return;
+  wait(1); if (emergencyStop) return;
+
+  // ── Phase 2 ────────────────────────────────────────
+  Serial.println("[SEQ] liftFor down");
+  liftFor("down", 40);
+  if (emergencyStop) return;
+  wait(1); if (emergencyStop) return;
+
+  Serial.println("[SEQ] Go_Side_Way");
+  Go_Side_Way(100, 60);
+  if (emergencyStop) return;
+  wait(1); if (emergencyStop) return;
+
+  Serial.println("[SEQ] turnRight");
+  turnRight(5, 60);
+  if (emergencyStop) return;
+  wait(1); if (emergencyStop) return;
+
+  // ── Phase 3 ────────────────────────────────────────
+  Serial.println("[SEQ] moveBackward");
+  moveBackward(2700, 60);
+  if (emergencyStop) { sequenceRunning = false; return; }
+  wait(1); if (emergencyStop) { sequenceRunning = false; return; }
+
+  Serial.println("[SEQ] Complete");
+  sequenceRunning = false;
+}
+
+
+void setup() {
+  Serial.begin(115200); //
+
+  pinMode(Motor1_Dir1, OUTPUT); pinMode(Motor1_Dir2, OUTPUT);
+  pinMode(Motor2_Dir1, OUTPUT); pinMode(Motor2_Dir2, OUTPUT);
+  pinMode(Motor3_Dir1, OUTPUT); pinMode(Motor3_Dir2, OUTPUT);
+  pinMode(Motor4_Dir1, OUTPUT); pinMode(Motor4_Dir2, OUTPUT); //
+
+  ledcSetup(PWM_CH1, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor1_PWM, PWM_CH1);
+  ledcSetup(PWM_CH2, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor2_PWM, PWM_CH2);
+  ledcSetup(PWM_CH3, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor3_PWM, PWM_CH3);
+  ledcSetup(PWM_CH4, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor4_PWM, PWM_CH4);
+
+  pinMode(Enc_1_A, INPUT_PULLUP); pinMode(Enc_1_B, INPUT_PULLUP);
+  pinMode(Enc_2_A, INPUT_PULLUP); pinMode(Enc_2_B, INPUT_PULLUP);
+  pinMode(Enc_3_A, INPUT_PULLUP); pinMode(Enc_3_B, INPUT_PULLUP);
+  pinMode(Enc_4_A, INPUT_PULLUP); pinMode(Enc_4_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(Enc_1_A), readEncoder1, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_2_A), readEncoder2, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_3_A), readEncoder3, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_4_A), readEncoder4, RISING);
+
+  stopAll();
+
+  // WiFi AP and ESP-NOW initialization
+  WiFi.mode(WIFI_AP_STA); 
+  WiFi.softAP(AP_SSID, AP_PASS, 1); // channel 1 must match slave ESPNOW_WIFI_CHANNEL
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    return;
+  } 
+
+  esp_now_register_recv_cb(onEspNowRecv);
+
+  memcpy(peerInfo.peer_addr, liftAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false; //
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add lift peer");
+    return;
+  }
+
+  memcpy(peerInfo.peer_addr, armAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add arm peer");
+    return;
+  }
+
+  // Broadcast peer for arm commands (guarantees delivery regardless of MAC)
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, ESPNOW_BROADCAST, 6);
+  peerInfo.channel = 0;  // 0 = use current channel
+  peerInfo.encrypt = false;
+
+  if (!esp_now_is_peer_exist(ESPNOW_BROADCAST)) {
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add broadcast peer");
+    }
+  } //
+
+  server.on("/",      HTTP_GET, handleRoot);
+  server.on("/move",  HTTP_GET, handleMove);
+  server.on("/lift",  HTTP_GET, handleLift);
+  server.on("/arm",   HTTP_GET, handleArm);
+  server.on("/start", HTTP_GET, handleStart);
+  server.on("/stop",  HTTP_GET, handleStop);
+  server.begin(); //
+}
+
+void loop() {
+  server.handleClient(); //
+
+  if (pendingCmd != CMD_NONE) {
+    CmdType cmd = pendingCmd;
+    pendingCmd  = CMD_NONE;
+    switch (cmd) {
+      case CMD_FWD:      moveForward(pendingTicks, pendingSpeed); break;
+      case CMD_BWD:      moveBackward(pendingTicks, pendingSpeed); break;
+      case CMD_STRAFE_L: Go_Side_Way(-pendingTicks, pendingSpeed); break;
+      case CMD_STRAFE_R: Go_Side_Way(pendingTicks, pendingSpeed); break;
+      case CMD_TURN_L:   turnLeft(pendingTicks, pendingSpeed); break;
+      case CMD_TURN_R:   turnRight(pendingTicks, pendingSpeed); break;
+      case CMD_SEQUENCE: runSequence();            break;
+      default: break;
+    }
+  }
+}

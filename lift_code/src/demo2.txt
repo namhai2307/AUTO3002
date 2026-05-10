@@ -1,0 +1,157 @@
+#include <Wire.h>
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+// --- Hardware & Sensor Definitions ---
+#define MMA8452Q_ADDR 0x1D
+#define WHO_AM_I      0x0D 
+#define CTRL_REG1     0x2A
+#define OUT_X_MSB     0x01
+
+#define AIN1 1
+#define AIN2 2
+#define PWMA 3
+#define PWMB 12
+#define STBY 16
+#define BIN1 10
+#define BIN2 11
+
+// --- ESP-NOW Communication ---
+typedef struct struct_message {
+    char command[10];
+} struct_message;
+
+struct_message incomingData;
+volatile bool newCommand = false;
+
+// --- Helper Functions for Sensor ---
+void writeRegister(byte reg, byte value) {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+byte readRegister(byte reg) {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MMA8452Q_ADDR, 1);
+  return Wire.read();
+}
+
+void readAccel(int16_t &x, int16_t &y, int16_t &z) {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(OUT_X_MSB);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MMA8452Q_ADDR, 6);
+  int16_t rawX = (Wire.read() << 8) | Wire.read();
+  int16_t rawY = (Wire.read() << 8) | Wire.read();
+  int16_t rawZ = (Wire.read() << 8) | Wire.read();
+  x = rawX >> 4; y = rawY >> 4; z = rawZ >> 4;
+}
+
+// --- Movement Functions with Leveling Logic ---
+void liftDownLeveling(float roll) {
+  long power_down = map(abs(roll), 0, 90, 0, 150);
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+
+  if (roll < -5) { analogWrite(PWMA, 150); analogWrite(PWMB, power_down); }
+  else if (roll > 5) { analogWrite(PWMA, power_down); analogWrite(PWMB, 150); }
+  else { analogWrite(PWMA, 150); analogWrite(PWMB, 150); }
+}
+
+void liftUpLeveling(float roll) {
+  long power = map(abs(roll), 0, 90, 0, 255);
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
+
+  if (roll < -5) { analogWrite(PWMA, power); analogWrite(PWMB, 255); }
+  else if (roll > 5) { analogWrite(PWMA, 255); analogWrite(PWMB, power); }
+  else { analogWrite(PWMA, 255); analogWrite(PWMB, 255); }
+}
+
+void stopMotor() {
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+  analogWrite(PWMA, 0); analogWrite(PWMB, 0);
+}
+
+// --- ESP-NOW Callback ---
+void OnDataRecv(const uint8_t * mac, const uint8_t *data, int len) {
+  memcpy(&incomingData, data, sizeof(incomingData));
+  newCommand = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(17, 18);
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(2);
+
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);  
+
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, HIGH);
+
+  // Initialize WiFi for ESP-NOW
+  WiFi.mode(WIFI_STA);
+  Serial.print("Slave MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    tft.println("ESP-NOW Init Failed");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Sensor Check
+  byte id = readRegister(WHO_AM_I);
+  if (id != 0x2A) {
+    tft.println("Sensor NOT found!");
+    while (1);
+  }
+  writeRegister(CTRL_REG1, 0x00);
+  writeRegister(CTRL_REG1, 0x01);
+  tft.println("Ready & Linked");
+}
+
+void loop() {
+  int16_t x, y, z;
+  readAccel(x, y, z);
+  float x_g = x / 1024.0;
+  float y_g = y / 1024.0;
+  float z_g = z / 1024.0;
+  float roll = atan2(y_g, sqrt(x_g * x_g + z_g * z_g)) * 180.0 / PI;
+
+  tft.setCursor(0, 40);
+  tft.fillRect(0, 40, 240, 60, TFT_BLACK);
+  tft.print("Roll: "); tft.println(roll, 1);
+  tft.print("Cmd: "); tft.println(incomingData.command);
+
+  // Execute Leveling Based on Received Command
+  if (strcmp(incomingData.command, "up") == 0) {
+    liftUpLeveling(roll);
+  } 
+  else if (strcmp(incomingData.command, "down") == 0) {
+    liftDownLeveling(roll);
+  } 
+  else {
+    stopMotor();
+  }
+
+  // Optional: Automatically stop if no new command is sent for a while
+  // Or handle "stop" command if sent from Master
+  delay(100);
+}

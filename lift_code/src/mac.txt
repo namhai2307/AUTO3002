@@ -1,0 +1,38 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* AP_SSID = "TTGO-Hotspot";
+const char* AP_PASS = "12345678";
+
+WebServer server(80);
+
+void handleRoot() {
+    String mac = WiFi.macAddress();
+    String html = "<!DOCTYPE html><html><head><title>TTGO Info</title></head><body>";
+    html += "<h1>TTGO MAC Address</h1>";
+    html += "<p><b>MAC:</b> " + mac + "</p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void setup() {
+    Serial.begin(9600);
+    delay(1000);
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
+
+    server.on("/", handleRoot);
+    server.begin();
+    Serial.println("Web server started. Connect to 'TTGO-Hotspot' and visit http://192.168.4.1");
+}
+
+void loop() {
+    server.handleClient();
+}

@@ -1,0 +1,245 @@
+#include <Arduino.h>
+
+// White = A; Green = B
+
+// ── Pin definitions ──────────────────────────────────────────
+#define Enc_1_A     14
+#define Enc_1_B     13
+#define Motor1_Dir1 19
+#define Motor1_Dir2 12
+#define Motor1_PWM  21
+
+#define Enc_2_A     4
+#define Enc_2_B     15
+#define Motor2_Dir1 16
+#define Motor2_Dir2 2
+#define Motor2_PWM  0
+
+#define Enc_3_A     23
+#define Enc_3_B     22
+#define Motor3_Dir1 5
+#define Motor3_Dir2 17
+#define Motor3_PWM  18
+
+#define Enc_4_A     32
+#define Enc_4_B     33
+#define Motor4_Dir1 27
+#define Motor4_Dir2 26
+#define Motor4_PWM  25
+
+// ── Encoder tick counters ────────────────────────────────────
+volatile long ticks1 = 0;
+volatile long ticks2 = 0;
+volatile long ticks3 = 0;
+volatile long ticks4 = 0;
+
+void IRAM_ATTR readEncoder1() { ticks1 += (digitalRead(Enc_1_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder2() { ticks2 += (digitalRead(Enc_2_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder3() { ticks3 += (digitalRead(Enc_3_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder4() { ticks4 += (digitalRead(Enc_4_B) > 0) ? 1 : -1; }
+
+void resetTicks() {
+  noInterrupts();
+  ticks1 = ticks2 = ticks3 = ticks4 = 0;
+  interrupts();
+}
+
+void printEncoderTicks() {
+  noInterrupts();
+  long c1 = ticks1, c2 = ticks2, c3 = ticks3, c4 = ticks4;
+  interrupts();
+  Serial.print("Enc1: "); Serial.print(c1);
+  Serial.print("  Enc2: "); Serial.print(c2);
+  Serial.print("  Enc3: "); Serial.print(c3);
+  Serial.print("  Enc4: "); Serial.println(c4);
+}
+
+// ── Low-level direction helpers ──────────────────────────────
+// dir: 1 = forward, -1 = backward, 0 = stop
+static void motor1SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor1_Dir1, HIGH); digitalWrite(Motor1_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, HIGH); }
+  else              { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, LOW); }
+}
+static void motor2SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor2_Dir1, HIGH); digitalWrite(Motor2_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, HIGH); }
+  else              { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, LOW); }
+}
+static void motor3SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor3_Dir1, HIGH); digitalWrite(Motor3_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, HIGH); }
+  else              { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, LOW); }
+}
+static void motor4SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor4_Dir1, HIGH); digitalWrite(Motor4_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, HIGH); }
+  else              { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, LOW); }
+}
+
+void stopAll() { motor1SetDir(0); motor2SetDir(0); motor3SetDir(0); motor4SetDir(0); }
+
+// ── Individual motor drive ───────────────────────────────────
+// ticks > 0 = forward, ticks < 0 = backward.
+// Blocks until this motor's encoder has moved |ticks| counts, then stops.
+void motor1Drive(long ticks) {
+  noInterrupts(); ticks1 = 0; interrupts();
+  if (ticks == 0) return;
+  motor1SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  while (true) {
+    noInterrupts(); long c = abs(ticks1); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  motor1SetDir(0);
+}
+void motor2Drive(long ticks) {
+  noInterrupts(); ticks2 = 0; interrupts();
+  if (ticks == 0) return;
+  motor2SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  while (true) {
+    noInterrupts(); long c = abs(ticks2); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  motor2SetDir(0);
+}
+void motor3Drive(long ticks) {
+  noInterrupts(); ticks3 = 0; interrupts();
+  if (ticks == 0) return;
+  motor3SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  while (true) {
+    noInterrupts(); long c = abs(ticks3); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  motor3SetDir(0);
+}
+void motor4Drive(long ticks) {
+  noInterrupts(); ticks4 = 0; interrupts();
+  if (ticks == 0) return;
+  motor4SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  while (true) {
+    noInterrupts(); long c = abs(ticks4); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  motor4SetDir(0);
+}
+
+// ── Combined movement (all 4 motors, blocks until average ticks reached) ─────
+// Right side (motors 1 & 2): forward = dir 1
+// Left  side (motors 3 & 4): mirrored mounting, forward = dir -1
+// Flip signs below if your robot goes the wrong way.
+
+void moveForward(long ticks) {
+  resetTicks();
+  motor1SetDir(1);  motor2SetDir(1);
+  motor3SetDir(-1); motor4SetDir(-1);
+  while (true) {
+    noInterrupts();
+    long avg = (abs(ticks1) + abs(ticks2) + abs(ticks3) + abs(ticks4)) / 4;
+    interrupts();
+    if (avg >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+void moveBackward(long ticks) {
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1);
+  motor3SetDir(1);  motor4SetDir(1);
+  while (true) {
+    noInterrupts();
+    long avg = (abs(ticks1) + abs(ticks2) + abs(ticks3) + abs(ticks4)) / 4;
+    interrupts();
+    if (avg >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+// Turn left (CCW): right side forward, left side backward
+void turnLeft(long ticks) {
+  resetTicks();
+  motor1SetDir(1);  motor2SetDir(1);
+  motor3SetDir(1);  motor4SetDir(1);
+  while (true) {
+    noInterrupts();
+    long avg = (abs(ticks1) + abs(ticks2) + abs(ticks3) + abs(ticks4)) / 4;
+    interrupts();
+    if (avg >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+// Turn right (CW): right side backward, left side forward
+void turnRight(long ticks) {
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1);
+  motor3SetDir(-1); motor4SetDir(-1);
+  while (true) {
+    noInterrupts();
+    long avg = (abs(ticks1) + abs(ticks2) + abs(ticks3) + abs(ticks4)) / 4;
+    interrupts();
+    if (avg >= ticks) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+// Strafe right (ticks > 0) or left (ticks < 0)
+// Mecanum pattern: front-left & rear-right forward, front-right & rear-left backward = strafe right
+// Motor layout: 1=front-right, 2=rear-right, 3=rear-left, 4=front-left
+// Left side motors (3 & 4) are mirrored, so their dir signs are flipped vs right side.
+void Go_Side_Way(long ticks) {
+  if (ticks == 0) return;
+  resetTicks();
+  int d = (ticks > 0) ? 1 : -1;  // d=1 → strafe right
+  motor1SetDir(-d);  // front-right: backward for strafe right
+  motor2SetDir(d);   // rear-right:  forward  for strafe right
+  motor3SetDir(d);   // rear-left:   backward physically, but mirrored → +d
+  motor4SetDir(-d);  // front-left:  forward  physically, but mirrored → -d
+  long target = abs(ticks);
+  while (true) {
+    noInterrupts();
+    long avg = (abs(ticks1) + abs(ticks2) + abs(ticks3) + abs(ticks4)) / 4;
+    interrupts();
+    if (avg >= target) break;
+    delay(5);
+  }
+  stopAll();
+}
+
+
+// ── Setup & Loop ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(Motor1_Dir1, OUTPUT); pinMode(Motor1_Dir2, OUTPUT);
+  pinMode(Motor2_Dir1, OUTPUT); pinMode(Motor2_Dir2, OUTPUT);
+  pinMode(Motor3_Dir1, OUTPUT); pinMode(Motor3_Dir2, OUTPUT);
+  pinMode(Motor4_Dir1, OUTPUT); pinMode(Motor4_Dir2, OUTPUT);
+  stopAll();
+
+  pinMode(Enc_1_A, INPUT_PULLUP); pinMode(Enc_1_B, INPUT_PULLUP);
+  pinMode(Enc_2_A, INPUT_PULLUP); pinMode(Enc_2_B, INPUT_PULLUP);
+  pinMode(Enc_3_A, INPUT_PULLUP); pinMode(Enc_3_B, INPUT_PULLUP);
+  pinMode(Enc_4_A, INPUT_PULLUP); pinMode(Enc_4_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(Enc_1_A), readEncoder1, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_2_A), readEncoder2, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_3_A), readEncoder3, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_4_A), readEncoder4, RISING);
+}
+
+void loop() {
+  Go_Side_Way(1500);
+  delay(1000);
+}

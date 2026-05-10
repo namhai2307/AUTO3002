@@ -1,0 +1,528 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+
+// ── WiFi Access Point ────────────────────────────────────────
+const char* AP_SSID = "ChassisControl";
+const char* AP_PASS = "12345678";   // min 8 chars
+
+WebServer server(80);
+
+// ── Pending command (set by web handler, executed in loop) ───
+enum CmdType { CMD_NONE, CMD_FWD, CMD_BWD, CMD_STRAFE_L, CMD_STRAFE_R, CMD_TURN_L, CMD_TURN_R };
+CmdType pendingCmd  = CMD_NONE;
+long    pendingTicks = 0;
+int     pendingSpeed = 50;  // 0–100 %
+
+// ── HTML control panel ───────────────────────────────────────
+static const char INDEX_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chassis Control</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#1a1a2e;color:#eee;font-family:Arial,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:24px}
+  h1{font-size:1.4rem;letter-spacing:2px;color:#e94560}
+  .ticks-row{display:flex;align-items:center;gap:10px}
+  .ticks-row label{font-size:.9rem;color:#aaa}
+  input[type=number]{background:#16213e;border:1px solid #e94560;color:#eee;padding:8px 12px;border-radius:8px;width:110px;font-size:1rem;text-align:center}
+  .dpad{display:grid;grid-template-columns:64px 64px 64px;grid-template-rows:64px 64px 64px;gap:6px}
+  .btn{background:#16213e;border:2px solid #e94560;border-radius:10px;color:#eee;font-size:1.4rem;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+  .btn:active,.btn.active{background:#e94560}
+  .btn.center{background:#0f3460;border-color:#0f3460;cursor:default}
+  .status{font-size:.8rem;color:#888;min-height:1.2em}
+</style>
+</head>
+<body>
+<h1>CHASSIS CONTROL</h1>
+<div class="ticks-row">
+  <label>Ticks:</label>
+  <input type="number" id="ticks" value="1500" min="1">
+</div>
+<div class="ticks-row">
+  <label>Speed %:</label>
+  <input type="number" id="speed" value="50" min="1" max="100">
+</div>
+<div class="dpad">
+  <!-- row 1 -->
+  <button class="btn" id="btnTL" onclick="send('turn_l')">&#8634;</button>
+  <button class="btn" id="btnFwd" onclick="send('fwd')">&#9650;</button>
+  <button class="btn" id="btnTR" onclick="send('turn_r')">&#8635;</button>
+  <!-- row 2 -->
+  <button class="btn" id="btnL" onclick="send('strafe_l')">&#9668;</button>
+  <div class="btn center"></div>
+  <button class="btn" id="btnR" onclick="send('strafe_r')">&#9658;</button>
+  <!-- row 3 -->
+  <div class="btn center"></div>
+  <button class="btn" id="btnBwd" onclick="send('bwd')">&#9660;</button>
+  <div class="btn center"></div>
+</div>
+<p class="status" id="status">Ready</p>
+<script>
+async function send(dir){
+  const t=document.getElementById('ticks').value||1500;
+  const s=document.getElementById('speed').value||50;
+  const btn=document.getElementById('btn'+{fwd:'Fwd',bwd:'Bwd',strafe_l:'L',strafe_r:'R',turn_l:'TL',turn_r:'TR'}[dir]);
+  document.getElementById('status').textContent='Running \u2026';
+  if(btn){btn.classList.add('active');}
+  try{
+    const r=await fetch('/move?dir='+dir+'&ticks='+t+'&speed='+s);
+    const txt=await r.text();
+    document.getElementById('status').textContent=txt;
+  }catch(e){
+    document.getElementById('status').textContent='Error: '+e;
+  }finally{
+    if(btn){btn.classList.remove('active');}
+  }
+}
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ── Web route handlers ───────────────────────────────────────
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleMove() {
+  if (!server.hasArg("dir") || !server.hasArg("ticks")) {
+    server.send(400, "text/plain", "Missing dir or ticks");
+    return;
+  }
+  String dir   = server.arg("dir");
+  long   ticks = server.arg("ticks").toInt();
+  int    speed = server.hasArg("speed") ? server.arg("speed").toInt() : 50;
+  if (ticks <= 0) { server.send(400, "text/plain", "Invalid ticks"); return; }
+  if (speed < 1)   speed = 1;
+  if (speed > 100) speed = 100;
+
+  if      (dir == "fwd")      pendingCmd = CMD_FWD;
+  else if (dir == "bwd")      pendingCmd = CMD_BWD;
+  else if (dir == "strafe_l") pendingCmd = CMD_STRAFE_L;
+  else if (dir == "strafe_r") pendingCmd = CMD_STRAFE_R;
+  else if (dir == "turn_l")   pendingCmd = CMD_TURN_L;
+  else if (dir == "turn_r")   pendingCmd = CMD_TURN_R;
+  else { server.send(400, "text/plain", "Unknown direction"); return; }
+
+  pendingTicks = ticks;
+  pendingSpeed = speed;
+  server.send(200, "text/plain", "OK: " + dir + " " + String(ticks) + " ticks @ " + String(speed) + "%");
+}
+
+// White = A; Green = B
+
+// ── Pin definitions ──────────────────────────────────────────
+
+// White = A; Green = B
+
+// Motor 1 - top right
+#define Enc_1_A     12
+#define Enc_1_B     13
+#define Motor1_Dir1 19
+#define Motor1_Dir2 14
+#define Motor1_PWM  21
+
+// Motor 2 - bottom right
+#define Enc_2_A     32
+#define Enc_2_B     33
+#define Motor2_Dir1 27
+#define Motor2_Dir2 26
+#define Motor2_PWM  25
+
+// Motor 3 - bottom left
+#define Enc_3_A     23
+#define Enc_3_B     22
+#define Motor3_Dir1 5
+#define Motor3_Dir2 17
+#define Motor3_PWM  18
+
+// Motor 4 - top left
+#define Enc_4_A     2
+#define Enc_4_B     15
+#define Motor4_Dir1 16
+#define Motor4_Dir2 4
+#define Motor4_PWM  0
+
+// ── LEDC (PWM) config ───────────────────────────────────────
+#define PWM_FREQ           20000  // Hz (20 kHz — above hearing range, eliminates beep)
+#define PWM_RESOLUTION     8      // bits → 0–255
+#define PWM_CH1            0
+#define PWM_CH2            1
+#define PWM_CH3            2
+#define PWM_CH4            3
+
+// Minimum duty cycle at which all motors reliably spin (L298N ~2V drop + stall threshold).
+// Tune this value upward if any motor still stalls at speed=1.
+#define MOTOR_MIN_DUTY     60     // out of 255 (~24%)
+#define SOFT_LAUNCH_STEPS  10     // ramp increments
+#define SOFT_LAUNCH_MS     20     // ms per step  (~200 ms total)
+
+// limit switches and sensors
+#define LIMIT_SW1  35 // motor 1 and 2
+#define LIMIT_SW2  34 // motor 3 and 4
+
+// ── Encoder tick counters ────────────────────────────────────
+volatile long ticks1 = 0;
+volatile long ticks2 = 0;
+volatile long ticks3 = 0;
+volatile long ticks4 = 0;
+
+void IRAM_ATTR readEncoder1() { ticks1 += (digitalRead(Enc_1_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder2() { ticks2 += (digitalRead(Enc_2_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder3() { ticks3 += (digitalRead(Enc_3_B) > 0) ? 1 : -1; }
+void IRAM_ATTR readEncoder4() { ticks4 += (digitalRead(Enc_4_B) > 0) ? 1 : -1; }
+
+void resetTicks() {
+  noInterrupts();
+  ticks1 = ticks2 = ticks3 = ticks4 = 0;
+  interrupts();
+}
+
+void printEncoderTicks() {
+  noInterrupts();
+  long c1 = ticks1, c2 = ticks2, c3 = ticks3, c4 = ticks4;
+  interrupts();
+  Serial.print("Enc1: "); Serial.print(c1);
+  Serial.print("  Enc2: "); Serial.print(c2);
+  Serial.print("  Enc3: "); Serial.print(c3);
+  Serial.print("  Enc4: "); Serial.println(c4);
+}
+
+// ── Low-level direction helpers ──────────────────────────────
+// dir: 1 = forward, -1 = backward, 0 = stop
+static void motor1SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor1_Dir1, HIGH); digitalWrite(Motor1_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, HIGH); }
+  else              { digitalWrite(Motor1_Dir1, LOW);  digitalWrite(Motor1_Dir2, LOW); }
+}
+static void motor2SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor2_Dir1, HIGH); digitalWrite(Motor2_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, HIGH); }
+  else              { digitalWrite(Motor2_Dir1, LOW);  digitalWrite(Motor2_Dir2, LOW); }
+}
+static void motor3SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor3_Dir1, HIGH); digitalWrite(Motor3_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, HIGH); }
+  else              { digitalWrite(Motor3_Dir1, LOW);  digitalWrite(Motor3_Dir2, LOW); }
+}
+static void motor4SetDir(int dir) {
+  if      (dir > 0) { digitalWrite(Motor4_Dir1, HIGH); digitalWrite(Motor4_Dir2, LOW); }
+  else if (dir < 0) { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, HIGH); }
+  else              { digitalWrite(Motor4_Dir1, LOW);  digitalWrite(Motor4_Dir2, LOW); }
+}
+
+static void setAllPWM(uint8_t duty) {
+  ledcWrite(PWM_CH1, duty);
+  ledcWrite(PWM_CH2, duty);
+  ledcWrite(PWM_CH3, duty);
+  ledcWrite(PWM_CH4, duty);
+}
+
+// Ramps all 4 motors from 0 → maxDuty over SOFT_LAUNCH_STEPS.
+// Returns true if any motor reached 'target' during the ramp (caller should stopAll).
+static bool softLaunchAllCheck(long target, uint8_t maxDuty) {
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    if (digitalRead(LIMIT_SW1) == HIGH || digitalRead(LIMIT_SW2) == HIGH) return true;
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((maxDuty - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    setAllPWM(duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts();
+    bool allDone = abs(ticks1) >= target || abs(ticks2) >= target ||
+                   abs(ticks3) >= target || abs(ticks4) >= target;
+    interrupts();
+    if (allDone) return true;
+  }
+  return false;
+}
+
+void stopAll() {
+  setAllPWM(0);
+  motor1SetDir(0); motor2SetDir(0); motor3SetDir(0); motor4SetDir(0);
+}
+
+// ── Individual motor drive ───────────────────────────────────
+// ticks > 0 = forward, ticks < 0 = backward.
+// Blocks until this motor's encoder has moved |ticks| counts, then stops.
+void motor1Drive(long ticks) {
+  noInterrupts(); ticks1 = 0; interrupts();
+  if (ticks == 0) return;
+  motor1SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  // Soft launch ramp
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY +
+                   ((255 - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    ledcWrite(PWM_CH1, duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts(); long c = abs(ticks1); interrupts();
+    if (c >= target) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); return; }
+  }
+  while (true) {
+    noInterrupts(); long c = abs(ticks1); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  ledcWrite(PWM_CH1, 0);
+  motor1SetDir(0);
+}
+void motor2Drive(long ticks) {
+  noInterrupts(); ticks2 = 0; interrupts();
+  if (ticks == 0) return;
+  motor2SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY +
+                   ((255 - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    ledcWrite(PWM_CH2, duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts(); long c = abs(ticks2); interrupts();
+    if (c >= target) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); return; }
+  }
+  while (true) {
+    noInterrupts(); long c = abs(ticks2); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  ledcWrite(PWM_CH2, 0);
+  motor2SetDir(0);
+}
+void motor3Drive(long ticks) {
+  noInterrupts(); ticks3 = 0; interrupts();
+  if (ticks == 0) return;
+  motor3SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY +
+                   ((255 - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    ledcWrite(PWM_CH3, duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts(); long c = abs(ticks3); interrupts();
+    if (c >= target) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); return; }
+  }
+  while (true) {
+    noInterrupts(); long c = abs(ticks3); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  ledcWrite(PWM_CH3, 0);
+  motor3SetDir(0);
+}
+void motor4Drive(long ticks) {
+  noInterrupts(); ticks4 = 0; interrupts();
+  if (ticks == 0) return;
+  motor4SetDir(ticks > 0 ? 1 : -1);
+  long target = abs(ticks);
+  for (int i = 0; i <= SOFT_LAUNCH_STEPS; i++) {
+    uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY +
+                   ((255 - MOTOR_MIN_DUTY) * i) / SOFT_LAUNCH_STEPS);
+    ledcWrite(PWM_CH4, duty);
+    delay(SOFT_LAUNCH_MS);
+    noInterrupts(); long c = abs(ticks4); interrupts();
+    if (c >= target) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); return; }
+  }
+  while (true) {
+    noInterrupts(); long c = abs(ticks4); interrupts();
+    if (c >= target) break;
+    delay(5);
+  }
+  ledcWrite(PWM_CH4, 0);
+  motor4SetDir(0);
+}
+
+// ── Combined movement (all 4 motors, blocks until average ticks reached) ─────
+// Right side (motors 1 & 2): forward = dir 1
+// Left  side (motors 3 & 4): mirrored mounting, forward = dir -1
+// Flip signs below if your robot goes the wrong way.
+
+void moveForward(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(1);  motor2SetDir(1);
+  motor3SetDir(-1); motor4SetDir(-1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  bool done1 = false, done2 = false, done3 = false, done4 = false;
+  while (!(done1 && done2 && done3 && done4)) {
+    if (!done1 && !done2 && digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && !done4 && digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (!done1 && c1 >= ticks) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; }
+    if (!done2 && c2 >= ticks) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && c3 >= ticks) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; }
+    if (!done4 && c4 >= ticks) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    delay(5);
+  }
+}
+
+void moveBackward(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1);
+  motor3SetDir(1);  motor4SetDir(1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  bool done1 = false, done2 = false, done3 = false, done4 = false;
+  while (!(done1 && done2 && done3 && done4)) {
+    if (!done1 && !done2 && digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && !done4 && digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (!done1 && c1 >= ticks) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; }
+    if (!done2 && c2 >= ticks) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && c3 >= ticks) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; }
+    if (!done4 && c4 >= ticks) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    delay(5);
+  }
+}
+
+// Turn left (CCW): right side forward, left side backward
+void turnLeft(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(1);  motor2SetDir(1);
+  motor3SetDir(1);  motor4SetDir(1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  bool done1 = false, done2 = false, done3 = false, done4 = false;
+  while (!(done1 && done2 && done3 && done4)) {
+    if (!done1 && !done2 && digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && !done4 && digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (!done1 && c1 >= ticks) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; }
+    if (!done2 && c2 >= ticks) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && c3 >= ticks) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; }
+    if (!done4 && c4 >= ticks) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    delay(5);
+  }
+}
+
+// Turn right (CW): right side backward, left side forward
+void turnRight(long ticks, int speed) {
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  motor1SetDir(-1); motor2SetDir(-1);
+  motor3SetDir(-1); motor4SetDir(-1);
+  if (softLaunchAllCheck(ticks, duty)) { stopAll(); return; }
+  bool done1 = false, done2 = false, done3 = false, done4 = false;
+  while (!(done1 && done2 && done3 && done4)) {
+    if (!done1 && !done2 && digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && !done4 && digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (!done1 && c1 >= ticks) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; }
+    if (!done2 && c2 >= ticks) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && c3 >= ticks) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; }
+    if (!done4 && c4 >= ticks) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    delay(5);
+  }
+}
+
+// Strafe right (ticks > 0) or left (ticks < 0)
+// Mecanum pattern: front-left & rear-right forward, front-right & rear-left backward = strafe right
+// Motor layout: 1=front-right, 2=rear-right, 3=rear-left, 4=front-left
+// Left side motors (3 & 4) are mirrored, so their dir signs are flipped vs right side.
+void Go_Side_Way(long ticks, int speed) {
+  if (ticks == 0) return;
+  uint8_t duty = (uint8_t)(MOTOR_MIN_DUTY + ((255 - MOTOR_MIN_DUTY) * constrain(speed, 1, 100)) / 100);
+  resetTicks();
+  int d = (ticks > 0) ? 1 : -1;  // d=1 → strafe right
+  motor1SetDir(-d);  // front-right: backward for strafe right
+  motor2SetDir(d);   // rear-right:  forward  for strafe right
+  motor3SetDir(d);   // rear-left:   backward physically, but mirrored → +d
+  motor4SetDir(-d);  // front-left:  forward  physically, but mirrored → -d
+  long target = abs(ticks);
+  if (softLaunchAllCheck(target, duty)) { stopAll(); return; }
+  bool done1 = false, done2 = false, done3 = false, done4 = false;
+  while (!(done1 && done2 && done3 && done4)) {
+    if (!done1 && !done2 && digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && !done4 && digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    noInterrupts();
+    long c1 = abs(ticks1), c2 = abs(ticks2), c3 = abs(ticks3), c4 = abs(ticks4);
+    interrupts();
+    if (!done1 && c1 >= target) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); done1 = true; }
+    if (!done2 && c2 >= target) { ledcWrite(PWM_CH2, 0); motor2SetDir(0); done2 = true; }
+    if (!done3 && c3 >= target) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); done3 = true; }
+    if (!done4 && c4 >= target) { ledcWrite(PWM_CH4, 0); motor4SetDir(0); done4 = true; }
+    delay(5);
+  }
+}
+
+
+// ── Setup & Loop ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(Motor1_Dir1, OUTPUT); pinMode(Motor1_Dir2, OUTPUT);
+  pinMode(Motor2_Dir1, OUTPUT); pinMode(Motor2_Dir2, OUTPUT);
+  pinMode(Motor3_Dir1, OUTPUT); pinMode(Motor3_Dir2, OUTPUT);
+  pinMode(Motor4_Dir1, OUTPUT); pinMode(Motor4_Dir2, OUTPUT);
+
+  // LEDC PWM channels
+  ledcSetup(PWM_CH1, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor1_PWM, PWM_CH1);
+  ledcSetup(PWM_CH2, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor2_PWM, PWM_CH2);
+  ledcSetup(PWM_CH3, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor3_PWM, PWM_CH3);
+  ledcSetup(PWM_CH4, PWM_FREQ, PWM_RESOLUTION); ledcAttachPin(Motor4_PWM, PWM_CH4);
+
+  stopAll();
+
+  pinMode(Enc_1_A, INPUT_PULLUP); pinMode(Enc_1_B, INPUT_PULLUP);
+  pinMode(Enc_2_A, INPUT_PULLUP); pinMode(Enc_2_B, INPUT_PULLUP);
+  pinMode(Enc_3_A, INPUT_PULLUP); pinMode(Enc_3_B, INPUT_PULLUP);
+  pinMode(Enc_4_A, INPUT_PULLUP); pinMode(Enc_4_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(Enc_1_A), readEncoder1, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_2_A), readEncoder2, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_3_A), readEncoder3, RISING);
+  attachInterrupt(digitalPinToInterrupt(Enc_4_A), readEncoder4, RISING);
+
+  pinMode(LIMIT_SW1, INPUT);   // external pull-down; HIGH = switch pressed
+  pinMode(LIMIT_SW2, INPUT);   // external pull-down; HIGH = switch pressed
+
+  // ── Start WiFi Access Point ──────────────────────────────
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());   // typically 192.168.4.1
+
+  server.on("/",     HTTP_GET, handleRoot);
+  server.on("/move", HTTP_GET, handleMove);
+  server.begin();
+  Serial.println("Web server started. Open http://192.168.4.1 in your browser.");
+}
+
+void loop() {
+  server.handleClient();   // process any incoming HTTP requests
+
+  // Safety: stop relevant motors and discard pending command while switch is pressed
+  if (digitalRead(LIMIT_SW1) == HIGH) { ledcWrite(PWM_CH1, 0); motor1SetDir(0); ledcWrite(PWM_CH2, 0); motor2SetDir(0); }
+  if (digitalRead(LIMIT_SW2) == HIGH) { ledcWrite(PWM_CH3, 0); motor3SetDir(0); ledcWrite(PWM_CH4, 0); motor4SetDir(0); }
+  if (digitalRead(LIMIT_SW1) == HIGH || digitalRead(LIMIT_SW2) == HIGH) {
+    pendingCmd = CMD_NONE;
+    return;
+  }
+
+  // Execute any command that was set by the web handler
+  if (pendingCmd != CMD_NONE) {
+    CmdType cmd = pendingCmd;
+    long    t   = pendingTicks;
+    int     spd = pendingSpeed;
+    pendingCmd  = CMD_NONE;   // clear before executing so a new command can queue
+
+    switch (cmd) {
+      case CMD_FWD:      moveForward(t, spd);     break;
+      case CMD_BWD:      moveBackward(t, spd);    break;
+      case CMD_STRAFE_L: Go_Side_Way(-t, spd);    break;
+      case CMD_STRAFE_R: Go_Side_Way(t, spd);     break;
+      case CMD_TURN_L:   turnLeft(t, spd);        break;
+      case CMD_TURN_R:   turnRight(t, spd);       break;
+      default: break;
+    }
+  }
+}
