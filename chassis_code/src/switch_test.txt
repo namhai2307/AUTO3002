@@ -1,0 +1,15 @@
+#include <Arduino.h>
+
+#define SWITCH_PIN 34
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(SWITCH_PIN, INPUT);  // Pin 34 has NO internal pull resistors - needs external 10k pull-down to GND
+}
+
+void loop() {
+    int switchState = digitalRead(SWITCH_PIN);
+    Serial.print("Switch: ");
+    Serial.println(switchState);
+    delay(200);
+}

@@ -744,11 +744,11 @@ void runSequence() {
   if (emergencyStop) return;
 
   
-  liftFor("up", 25); // change back to 21 if doesnt work
+  liftFor("up", 26); // change back to 21 if doesnt work
   if (emergencyStop) return;
   wait(1); if (emergencyStop) return;
  
-  moveForward(135, 60);
+  moveForward(150, 60);
   if (emergencyStop) {return; }
   wait(1); if (emergencyStop) return;
  
@@ -779,7 +779,7 @@ void runSequence() {
   if (emergencyStop) return;
   wait(1); if (emergencyStop) return;
 
-  turnLeft(20, 70);
+  turnLeft(25, 70);
   if (emergencyStop) {return; }
   wait(1); if (emergencyStop) return;
  
@@ -802,15 +802,11 @@ void runSequence() {
   if (emergencyStop) return;
   wait(1); if (emergencyStop) return;
 
-  turnRight(870, 50);
+  turnRight(10, 70);
   if (emergencyStop) {return; }
   wait(1); if (emergencyStop) return;
-
-  moveForward(15, 70);
-  if (emergencyStop) { sequenceRunning = false; return; }
-  wait(1); if (emergencyStop) { sequenceRunning = false; return; }
  
-  Go_Side_Way(3100, 60);
+  moveBackward(2500, 60);
   if (emergencyStop) { sequenceRunning = false; return; }
   wait(1); if (emergencyStop) { sequenceRunning = false; return; }
 

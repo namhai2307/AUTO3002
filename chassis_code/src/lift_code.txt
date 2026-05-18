@@ -12,15 +12,19 @@ TFT_eSPI tft = TFT_eSPI();
 #define CTRL_REG1     0x2A
 #define OUT_X_MSB     0x01
 
-#define AIN1 1
-#define AIN2 2
-#define PWMA 3
-#define PWMB 12
+#define AIN1 1 //left
+#define AIN2 2 //right
+#define PWMA 3 // left
+#define PWMB 12 // right
 #define STBY 16
 #define BIN1 10
 #define BIN2 11
 
 #define threshold 3
+
+// Compensation for left actuator imbalance.
+// Positive = left actuator runs faster, Negative = left actuator runs slower.
+const int LEFT_ACTUATOR_COMPENSATE = 10;
 
 // --- ESP-NOW Communication ---
 typedef struct struct_message {
@@ -63,9 +67,9 @@ void liftDownLeveling(float roll) {
   digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
   digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
 
-  if (roll < -threshold) { analogWrite(PWMA, 150); analogWrite(PWMB, power_down); }
-  else if (roll > threshold) { analogWrite(PWMA, power_down); analogWrite(PWMB, 150); }
-  else { analogWrite(PWMA, 150); analogWrite(PWMB, 150); }
+  if (roll < -threshold) { analogWrite(PWMA, constrain(150 + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, power_down); }
+  else if (roll > threshold) { analogWrite(PWMA, constrain(power_down + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, 150); }
+  else { analogWrite(PWMA, constrain(150 + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, 150); }
 }
 
 void liftUpLeveling(float roll) {
@@ -73,15 +77,25 @@ void liftUpLeveling(float roll) {
   digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
   digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
 
-  if (roll < -5) { analogWrite(PWMA, power); analogWrite(PWMB, 255); }
-  else if (roll > 5) { analogWrite(PWMA, 255); analogWrite(PWMB, power); }
-  else { analogWrite(PWMA, 255); analogWrite(PWMB, 255); }
+  if (roll < -3.5) { analogWrite(PWMA, constrain(power + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, 255); }
+  else if (roll > 3.5) { analogWrite(PWMA, constrain(255 + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, power); }
+  else { analogWrite(PWMA, constrain(255 + LEFT_ACTUATOR_COMPENSATE, 0, 255)); analogWrite(PWMB, 255); }
 }
 
 void stopMotor() {
   digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
   digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
   analogWrite(PWMA, 0); analogWrite(PWMB, 0);
+}
+
+void showDone() {
+  tft.fillScreen(TFT_GREEN);
+  tft.setTextColor(TFT_BLACK, TFT_GREEN);
+  tft.setTextSize(3);
+  tft.setCursor(50, 90);
+  tft.println("DONE!");
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(2);
 }
 
 // --- ESP-NOW Callback ---
@@ -149,6 +163,10 @@ void loop() {
   else if (strcmp(incomingData.command, "down") == 0) {
     liftDownLeveling(roll);
   } 
+  else if (strcmp(incomingData.command, "done") == 0) {
+    stopMotor();
+    showDone();
+  }
   else {
     stopMotor();
   }
